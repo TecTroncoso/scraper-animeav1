@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+httpx[http2]
+beautifulsoup4
+pydantic
+libsql-client
+python-dotenv
+lxml
+tenacity
+brotli
