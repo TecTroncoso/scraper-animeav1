@@ -1133,6 +1133,26 @@ async def scrape_anime_async(
 # 8. EPISODE SCRAPER (async + gather)
 # ============================================================================
 
+_ZILLA_NETWORKS_PLAY_RE = re.compile(
+    r"^https?://player\.zilla-networks\.com/play/(?P<id>[A-Za-z0-9_-]+)/?$",
+    re.IGNORECASE,
+)
+
+
+def _resolve_zilla_hls(url: Optional[str]) -> Optional[str]:
+    """Reescribe la URL del player de zilla-networks al endpoint real de HLS.
+
+    El endpoint /play/<id> devuelve una pagina HTML con JW Player que carga
+    el stream via JS. La URL real del m3u8 se sirve en /m3u8/<id>.
+    """
+    if not url:
+        return url
+    m = _ZILLA_NETWORKS_PLAY_RE.match(url.strip())
+    if not m:
+        return url
+    return f"https://player.zilla-networks.com/m3u8/{m.group('id')}"
+
+
 def _clasificar_tipo(server: str, url: str) -> TipoProveedor:
     s = (server or "").lower()
     u = (url or "").lower()
@@ -1160,6 +1180,7 @@ def _build_proveedor(server: str, raw_url: str, *, is_download: bool = False) ->
             server, raw_url[:120],
         )
     final_url = decoded or raw_url
+    final_url = _resolve_zilla_hls(final_url) or final_url
     tipo = _clasificar_tipo(server, final_url)
     if is_download and tipo == TipoProveedor.UNKNOWN:
         tipo = TipoProveedor.DOWNLOAD
