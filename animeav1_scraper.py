@@ -47,6 +47,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -80,9 +81,12 @@ DATA_DIR: Path = BASE_DIR / "data"
 LOGS_DIR: Path = BASE_DIR / "logs"
 LOG_FILE: Path = LOGS_DIR / "scrape.log"
 
-# JSONL unificado: 1 anime por linea, upsert por slug
+# Persistencia local deshabilitada: la fuente de verdad es Turso. Render tiene
+# un filesystem efimero y 512MB de RAM; escribir a disco (sobre todo el JSONL
+# reescrito entero en cada upsert) mata el proceso por OOM. Todos los artefactos
+# locales son no-op salvo cuando SAVE_LOCAL_ARTIFACTS=1 (uso local en Windows).
+_SAVE_LOCAL: bool = os.getenv("SAVE_LOCAL_ARTIFACTS", "0") == "1"
 ANIMES_JSONL_PATH: Path = DATA_DIR / "animes.jsonl"
-# Log de errores persistente (JSONL: 1 error por linea)
 ERRORS_LOG_PATH: Path = DATA_DIR / "errors.jsonl"
 
 # --- Configuracion del sitio ---
@@ -125,7 +129,9 @@ CATALOG_MAX_PAGES_FALLBACK: int = 100
 
 
 def ensure_dirs() -> None:
-    """Crea los directorios base si no existen."""
+    """Crea los directorios base si no existen. No-op cuando SAVE_LOCAL_ARTIFACTS!=1."""
+    if not _SAVE_LOCAL:
+        return
     for p in (DATA_DIR, LOGS_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
@@ -335,7 +341,6 @@ class AnimeDocument(BaseModel):
 # --- Logging ---
 
 def setup_logging(log_file: Path, level: int = logging.INFO) -> logging.Logger:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("animeav1")
     logger.setLevel(level)
     logger.propagate = False
@@ -344,12 +349,16 @@ def setup_logging(log_file: Path, level: int = logging.INFO) -> logging.Logger:
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
         sh = logging.StreamHandler()
         sh.setFormatter(fmt)
         logger.addHandler(sh)
+        # Solo escribe a disco si el usuario activo SAVE_LOCAL_ARTIFACTS=1.
+        # En Render no hay disco persistente y el FileHandler ralentiza + revienta.
+        if _SAVE_LOCAL:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
     return logger
 
 
@@ -1510,50 +1519,27 @@ def _save_jsonl_index(index: dict[str, bool]) -> None:
 
 
 def save_anime_jsonl(anime: Anime) -> Path:
-    """Hace upsert de un anime en el JSONL unificado.
+    """No-op en produccion: la fuente de verdad es Turso (database.py).
 
-    Estrategia:
-      - Si el slug ya esta en el indice, sobrescribe la linea correspondiente.
-      - Si es nuevo, agrega al final del JSONL.
-      - Actualiza el indice.
-      - Ejecuta validate_hierarchy y registra cualquier issue en el log
-        (NO genera archivos individuales por anime).
-
-    Args:
-        anime: el Anime a persistir.
-
-    Returns:
-        La ruta del JSONL.
+    En Render cada upsert releia el JSONL completo, lo mantenia en memoria y lo
+    reescribia entero: con animeav1 (~1000 animes) esto rompio el limite de 512MB.
+    Se conserva la firma y validacion de jerarquia (solo log) para uso local
+    cuando SAVE_LOCAL_ARTIFACTS=1.
     """
     log = logging.getLogger("animeav1.storage")
-    ANIMES_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Validar jerarquia antes de serializar (solo para log, no genera archivos)
     report = anime.validate_hierarchy()
     if report["issues"]:
         log.warning(
-            "Anime %s: %d problemas de integridad jerarquica detectados:",
+            "Anime %s: %d problemas de integridad jerarquica detectados",
             anime.id, len(report["issues"]),
         )
-        for issue in report["issues"][:10]:
-            log.warning("  - %s", issue)
-        if len(report["issues"]) > 10:
-            log.warning("  ... y %d mas", len(report["issues"]) - 10)
-    else:
-        log.debug(
-            "Anime %s: jerarquia OK (%d temp, %d caps, %d prov stream, %d dl)",
-            anime.id, report["temporadas"], report["capitulos"],
-            report["proveedores_stream"], report["proveedores_download"],
-        )
+    if not _SAVE_LOCAL:
+        return ANIMES_JSONL_PATH
 
-    # Serializar como 1 linea compacta (JSONL = JSON Lines)
+    ANIMES_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
     doc = AnimeDocument(anime=anime)
     line = doc.model_dump_json(indent=None, exclude_none=False)
-
-    # Cargar indice
     index = _load_jsonl_index()
-
-    # Upsert: si el slug existe, reemplazamos la linea; si no, append.
     if anime.id in index:
         all_lines: list[str] = []
         if ANIMES_JSONL_PATH.exists():
@@ -1570,16 +1556,12 @@ def save_anime_jsonl(anime: Anime) -> Path:
                 continue
         if not replaced:
             all_lines.append(line)
-        ANIMES_JSONL_PATH.write_text(
-            "\n".join(all_lines) + "\n", encoding="utf-8"
-        )
+        ANIMES_JSONL_PATH.write_text("\n".join(all_lines) + "\n", encoding="utf-8")
     else:
         with ANIMES_JSONL_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         index[anime.id] = True
         _save_jsonl_index(index)
-
-    log.debug("Anime %s guardado en JSONL (linea: %d bytes)", anime.id, len(line))
     return ANIMES_JSONL_PATH
 
 
@@ -1621,7 +1603,12 @@ def iter_animes_from_jsonl():
 # --- Log de errores (JSONL append-only) ---
 
 def log_error(scope: str, msg: str, *, severity: str = "ERROR") -> None:
-    """Registra un error en data/errors.jsonl (1 linea por error)."""
+    """No-op en produccion: errores van al logger (stdout, visible en Render logs).
+
+    Solo persiste a disco si SAVE_LOCAL_ARTIFACTS=1.
+    """
+    if not _SAVE_LOCAL:
+        return
     try:
         ERRORS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with ERRORS_LOG_PATH.open("a", encoding="utf-8") as f:
@@ -1989,17 +1976,21 @@ async def run_catalog_async(args) -> dict:
         animes = await scrape_all_animes_async(
             client, max_pages=args.max_pages, limit=args.limit
         )
-    cat_path = DATA_DIR / "catalog.json"
-    with cat_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "total": len(animes),
-                "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "animes": animes,
-            },
-            f, ensure_ascii=False, indent=2,
-        )
-    log.info("Catalogo guardado en %s (%d animes)", cat_path, len(animes))
+    if _SAVE_LOCAL:
+        cat_path = DATA_DIR / "catalog.json"
+        cat_path.parent.mkdir(parents=True, exist_ok=True)
+        with cat_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "total": len(animes),
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    "animes": animes,
+                },
+                f, ensure_ascii=False, indent=2,
+            )
+        log.info("Catalogo guardado en %s (%d animes)", cat_path, len(animes))
+    else:
+        log.info("Catalogo scrapeado en memoria (%d animes) — sin persistencia local", len(animes))
     return {"animes": len(animes), "elapsed_seconds": round(time.time() - started, 2)}
 
 
@@ -2010,19 +2001,24 @@ async def run_today_async(args) -> dict:
     async with build_async_http_client(args) as client:
         episodes = await scrape_today_episodes_async(client)
         latest_media = await scrape_latest_media_async(client)
-    out_path = DATA_DIR / "today.json"
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "episodes_today": [e for e in episodes if e.get("is_today")],
-                "episodes_latest": episodes,
-                "latest_media": latest_media,
-            },
-            f, ensure_ascii=False, indent=2,
-        )
-    log.info("Home guardado en %s (%d episodios, %d hoy)",
+    if _SAVE_LOCAL:
+        out_path = DATA_DIR / "today.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    "episodes_today": [e for e in episodes if e.get("is_today")],
+                    "episodes_latest": episodes,
+                    "latest_media": latest_media,
+                },
+                f, ensure_ascii=False, indent=2,
+            )
+        log.info("Home guardado en %s (%d episodios, %d hoy)",
              out_path, len(episodes), sum(1 for e in episodes if e.get("is_today")))
+    else:
+        log.info("Home scrapeado en memoria (%d episodios) — sin persistencia local",
+                 len(episodes))
     return {
         "episodes_total": len(episodes),
         "episodes_today": sum(1 for e in episodes if e.get("is_today")),
@@ -2091,10 +2087,14 @@ def run_validate(args) -> dict:
             "issues": report["issues"][:5],
         })
 
-    report_path = DATA_DIR / "hierarchy_report.json"
-    with report_path.open("w", encoding="utf-8") as f:
-        json.dump({"total": total, "per_anime": per_anime}, f, ensure_ascii=False, indent=2)
-    log.info("Reporte de jerarquia guardado en %s", report_path)
+    if _SAVE_LOCAL:
+        report_path = DATA_DIR / "hierarchy_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8") as f:
+            json.dump({"total": total, "per_anime": per_anime}, f, ensure_ascii=False, indent=2)
+        log.info("Reporte de jerarquia guardado en %s", report_path)
+    else:
+        log.info("Reporte de jerarquia calculado en memoria — sin persistencia local")
     log.info(
         "Resumen: %d animes | %d temporadas | %d capitulos | %d prov stream | %d descargas",
         total["animes"], total["temporadas"], total["capitulos"],
