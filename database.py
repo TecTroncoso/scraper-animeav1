@@ -44,11 +44,25 @@ async def save_anime_to_turso(anime_obj):
     capitulos_mapped = []
     total_episodes = 0
     
+    def _proveedor_to_dict(p):
+        metodo = p.metodo_decodificacion
+        metodo_val = metodo.value if hasattr(metodo, "value") else str(metodo)
+        tipo = p.tipo
+        tipo_val = tipo.value if hasattr(tipo, "value") else str(tipo)
+        return {
+            "nombre": p.nombre,
+            "url": p.url,
+            "metodo_decodificacion": metodo_val,
+            "tipo": tipo_val,
+            "dominio": (p.url or "").split("/")[2] if p.url else None,
+            "resoluciones": p.resoluciones or [],
+        }
+
     for temp in anime_obj.temporadas:
         for cap in temp.capitulos:
-            proveedores = [{"nombre": p.nombre, "url": p.url or p.url_raw} for p in cap.proveedores]
-            descargas = [{"nombre": d.nombre, "url": d.url or d.url_raw} for d in cap.descargas]
-            
+            proveedores = [_proveedor_to_dict(p) for p in cap.proveedores]
+            descargas = [_proveedor_to_dict(d) for d in cap.descargas]
+
             capitulos_mapped.append({
                 "numero": cap.numero,
                 "titulo": cap.titulo or f"Episodio {cap.numero}",
