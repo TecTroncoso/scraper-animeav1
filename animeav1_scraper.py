@@ -1139,18 +1139,47 @@ _ZILLA_NETWORKS_PLAY_RE = re.compile(
 )
 
 
-def _resolve_zilla_hls(url: Optional[str]) -> Optional[str]:
-    """Reescribe la URL del player de zilla-networks al endpoint real de HLS.
+# Tabla extensible: (host, path_prefix_antiguo, path_prefix_nuevo).
+# Cuando un proveedor entrega una URL HTML/embed, se reescribe al endpoint
+# real del stream antes de persistirla.
+_STREAM_HOST_REWRITES: list[tuple[str, str, str]] = [
+    # zilla-networks: /play/<id> (pagina HTML con JW Player) -> /m3u8/<id> (HLS)
+    ("player.zilla-networks.com", "/play/", "/m3u8/"),
+]
 
-    El endpoint /play/<id> devuelve una pagina HTML con JW Player que carga
-    el stream via JS. La URL real del m3u8 se sirve en /m3u8/<id>.
+
+def resolve_provider_stream_url(url: Optional[str]) -> tuple[Optional[str], bool]:
+    """Si la URL apunta a un reproductor HTML embebido, resuelve la URL del stream real.
+
+    Devuelve ``(url_resuelta, fue_resuelta)``:
+      * ``(None, False)`` si la entrada es None o vacia.
+      * ``(url, False)`` si la URL no requiere transformacion.
+      * ``(url_nueva, True)`` si se aplico una reescritura segun ``_STREAM_HOST_REWRITES``.
     """
     if not url:
-        return url
-    m = _ZILLA_NETWORKS_PLAY_RE.match(url.strip())
-    if not m:
-        return url
-    return f"https://player.zilla-networks.com/m3u8/{m.group('id')}"
+        return None, False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url, False
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    for host_pattern, old_prefix, new_prefix in _STREAM_HOST_REWRITES:
+        if host == host_pattern and path.startswith(old_prefix):
+            new_path = new_prefix + path[len(old_prefix):]
+            resolved = f"{parsed.scheme or 'https'}://{parsed.netloc}{new_path}"
+            if parsed.query:
+                resolved += "?" + parsed.query
+            if parsed.fragment:
+                resolved += "#" + parsed.fragment
+            return resolved, True
+    return url, False
+
+
+def _resolve_zilla_hls(url: Optional[str]) -> Optional[str]:
+    """Wrapper de compatibilidad: solo devuelve la URL resuelta o la original."""
+    resolved, _ = resolve_provider_stream_url(url)
+    return resolved
 
 
 def _clasificar_tipo(server: str, url: str) -> TipoProveedor:
@@ -1158,14 +1187,16 @@ def _clasificar_tipo(server: str, url: str) -> TipoProveedor:
     u = (url or "").lower()
     if any(k in s for k in ("mega", "mp4upload", "1fichier", "transferit")) and "download" in s:
         return TipoProveedor.DOWNLOAD
-    if "hls" in s or "stream" in s or "player" in s or "play" in s:
-        return TipoProveedor.EMBED
-    if "embed" in u or "/embed" in u or "iframe" in s:
-        return TipoProveedor.EMBED
-    if u.endswith(".mp4") or u.endswith(".mkv") or "m3u8" in u:
+    # Reglas por URL (tienen prioridad sobre el nombre del server, porque tras
+    # resolver zilla-networks el server sigue siendo "HLS" pero la URL ya es m3u8).
+    if u.endswith(".mp4") or u.endswith(".mkv") or "/m3u8" in u or u.endswith(".m3u8"):
         return TipoProveedor.DIRECT
     if "mega.nz/embed" in u or "mp4upload.com/embed" in u:
         return TipoProveedor.IFRAME
+    if "embed" in u or "/embed" in u or "iframe" in s:
+        return TipoProveedor.EMBED
+    if "hls" in s or "stream" in s or "player" in s or "play" in s:
+        return TipoProveedor.EMBED
     return TipoProveedor.UNKNOWN
 
 
@@ -1180,14 +1211,18 @@ def _build_proveedor(server: str, raw_url: str, *, is_download: bool = False) ->
             server, raw_url[:120],
         )
     final_url = decoded or raw_url
-    final_url = _resolve_zilla_hls(final_url) or final_url
+    resolved_url, was_resolved = resolve_provider_stream_url(final_url)
+    if was_resolved:
+        # El resolver realizo una transformacion programatica (player HTML -> HLS).
+        metodo = MetodoDecodificacion.JS_FUNCTION.value
+        final_url = resolved_url
     tipo = _clasificar_tipo(server, final_url)
     if is_download and tipo == TipoProveedor.UNKNOWN:
         tipo = TipoProveedor.DOWNLOAD
     return Proveedor(
         nombre=server or "Unknown",
         tipo=tipo,
-        url=decoded,
+        url=final_url or None,
         url_raw=raw_url if raw_url else None,
         metodo_decodificacion=MetodoDecodificacion(metodo),
     )
